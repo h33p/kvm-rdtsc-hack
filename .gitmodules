@@ -1,0 +1,3 @@
+[submodule "kernel-hook"]
+	path = kernel-hook
+	url = https://github.com/Heep042/kernel-hook.git
