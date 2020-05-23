@@ -12,7 +12,13 @@ static void vmhook_fini(void);
 module_init(vmhook_init);
 module_exit(vmhook_fini);
 
+int constant_tsc_offset = 1000;
+
+module_param(constant_tsc_offset,int,0660);
+
 #define printkvm(format, ...) printk(KBUILD_MODNAME": "format, ##__VA_ARGS__)
+
+int (*kvm_set_tsc_khz)(struct kvm_vcpu *vcpu, u32 user_tsc_khz) = NULL;
 
 //We do not really support multiple KVM instances here
 struct vcpu_offset_info {
@@ -24,7 +30,6 @@ struct vcpu_offset_info {
 } cpu_offsets[KVM_MAX_VCPUS] = {
 	{
 		.vcpu = NULL,
-		.cpu_id = -1,
 		.called_cpuid = 0,
 		.temp_offset = 0,
 		.vmexit_tsc = 0
@@ -37,7 +42,6 @@ static struct vcpu_offset_info* get_cpu_offset_info(struct kvm_vcpu *vcpu) {
 	if (ret->vcpu != vcpu) {
 		*ret = (struct vcpu_offset_info) {
 			.vcpu = vcpu,
-			.cpu_id = -1,
 			.called_cpuid = 0,
 			.temp_offset = 0,
 			.vmexit_tsc = rdtsc()
@@ -51,68 +55,81 @@ static void vcpu_post_run(struct kvm_vcpu *vcpu) {
 	u64 cur_tsc;
 	struct vcpu_offset_info *off_info;
 
-	preempt_disable();
-
 	cur_tsc = rdtsc();
 	off_info = get_cpu_offset_info(vcpu);
 	off_info->vcpu = vcpu;
 	off_info->vmexit_tsc = cur_tsc;
-	off_info->cpu_id = smp_processor_id();
-
-	preempt_enable();
 }
 
 static void vcpu_pre_run(struct kvm_vcpu *vcpu) {
 	u64 cur_tsc, off, tsc_offset, new_tsc_offset;
 	s64 tsc_shift_back;
+	int called_cpuid;
 	struct vcpu_offset_info *off_info;
-
-	preempt_disable();
+	int tsc_off = constant_tsc_offset;
 
 	tsc_offset = kvm_x86_ops->read_l1_tsc_offset(vcpu);
 	new_tsc_offset = tsc_offset;
 	off_info = get_cpu_offset_info(vcpu);
 
-	if (off_info->cpu_id == smp_processor_id()) {
-		if (off_info->called_cpuid) {
+	called_cpuid = off_info->called_cpuid;
+
+	if (called_cpuid) {
+			/* Needs to be applied on CPU creation, also, we probably can not scale the TSC down */
+			/*if (kvm_set_tsc_khz)
+				kvm_set_tsc_khz(vcpu, tsc_khz * 10);*/
 			cur_tsc = rdtsc();
-			off = -kvm_scale_tsc(vcpu, 1000 + cur_tsc - off_info->vmexit_tsc);
+			off = -kvm_scale_tsc(vcpu, tsc_off + cur_tsc - off_info->vmexit_tsc);
 			new_tsc_offset += off;
 			off_info->temp_offset += off;
-		} else { /* Shift the tsc back if not cpuid exit */
+
+	} else { /* Shift the tsc back if not cpuid exit */
 			tsc_shift_back = off_info->temp_offset;
-			if (tsc_shift_back < -500)
-				tsc_shift_back = -500;
+			if (tsc_shift_back < -tsc_off / 2)
+					tsc_shift_back = -tsc_off / 2;
 			new_tsc_offset -= tsc_shift_back;
 			off_info->temp_offset -= tsc_shift_back;
-		}
-
-		if (tsc_offset ^ new_tsc_offset)
-			vcpu->arch.tsc_offset = kvm_x86_ops->write_l1_tsc_offset(vcpu, new_tsc_offset);
 	}
 
-	off_info->called_cpuid = 0;
+	if (tsc_offset ^ new_tsc_offset)
+			vcpu->arch.tsc_offset = kvm_x86_ops->write_l1_tsc_offset(vcpu, new_tsc_offset);
 
-	preempt_enable();
+	off_info->called_cpuid = 0;
 }
 
-DEFINE_STATIC_HOOK(int, kvm_emulate_cpuid, struct kvm_vcpu *vcpu)
+DEFINE_STATIC_FUNCTION_HOOK(int, kvm_emulate_cpuid, struct kvm_vcpu *vcpu)
 {
 	DEFINE_ORIGINAL(kvm_emulate_cpuid);
 
-	get_cpu_offset_info(vcpu)->called_cpuid = 1;
+	if (vcpu->arch.regs[VCPU_REGS_RAX] == 0)
+		get_cpu_offset_info(vcpu)->called_cpuid = 1;
 
 	return orig_fn(vcpu);
 }
 
-DEFINE_STATIC_HOOK(void, kvm_vcpu_run, struct kvm_vcpu *vcpu)
+DEFINE_STATIC_FUNCTION_HOOK(void, kvm_load_host_xsave_state, struct kvm_vcpu *vcpu)
 {
-	DEFINE_ORIGINAL(kvm_vcpu_run);
+	DEFINE_ORIGINAL(kvm_load_host_xsave_state);
 
-	vcpu_pre_run(vcpu);
-	orig_fn(vcpu);
 	vcpu_post_run(vcpu);
+	/*preempt_enable();
+	local_irq_enable();*/
+
+	orig_fn(vcpu);
 }
+
+DEFINE_STATIC_FUNCTION_HOOK(void, kvm_load_guest_xsave_state, struct kvm_vcpu *vcpu)
+{
+	DEFINE_ORIGINAL(kvm_load_guest_xsave_state);
+
+	orig_fn(vcpu);
+
+	/*local_irq_disable();
+	preempt_disable();*/
+	vcpu_pre_run(vcpu);
+}
+
+int callcount = 0;
 
 static int error_quit(const char *msg)
 {
@@ -120,14 +137,10 @@ static int error_quit(const char *msg)
 	return -EFAULT;
 }
 
-DEFINE_HOOK_GETTER(kvm_vcpu_run)
-{
-       return (uintptr_t)kvm_x86_ops->run;
-}
-
 static const fthinit_t hook_list[] = {
 	HLIST_NAME_ENTRY(kvm_emulate_cpuid),
-	HLIST_GETTER_ENTRY(kvm_vcpu_run)
+	HLIST_NAME_ENTRY(kvm_load_host_xsave_state),
+	HLIST_NAME_ENTRY(kvm_load_guest_xsave_state)
 };
 
 static int vmhook_init(void)
@@ -136,14 +149,16 @@ static int vmhook_init(void)
 
 	printkvm("initializing...\n");
 
+	kvm_set_tsc_khz = (typeof(kvm_set_tsc_khz))kallsyms_lookup_name("kvm_set_tsc_khz");
+
 	ret = start_hook_list(hook_list, ARRAY_SIZE(hook_list));
 
 	if (ret == -1)
 		return error_quit("Last error: Failed to lookup symbols!");
 	else if (ret == 1)
-		return error_quit("Last error: Failed to call ftrace_set_filter_ip!");
+		return error_quit("Last error: Failed to call ftrace_set_filter_ip! (1)");
 	else if (ret == 2)
-		return error_quit("Last error: Failed to call ftrace_set_filter_ip!");
+		return error_quit("Last error: Failed to call ftrace_set_filter_ip! (2)");
 
 	printkvm("KVMHook initialized!\n");
 
