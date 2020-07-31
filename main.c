@@ -1,6 +1,7 @@
 #include "kernel-hook/hook.h"
 #include <linux/kvm_types.h>
 #include <linux/kvm_host.h>
+#include <linux/kprobes.h>
 
 MODULE_DESCRIPTION("Hook and correct KVM TSC timer on X86 platforms. Only one KVM instance is supported.");
 MODULE_AUTHOR("Heep");
@@ -19,6 +20,18 @@ module_param(constant_tsc_offset,int,0660);
 #define printkvm(format, ...) printk(KBUILD_MODNAME": "format, ##__VA_ARGS__)
 
 int (*kvm_set_tsc_khz)(struct kvm_vcpu *vcpu, u32 user_tsc_khz) = NULL;
+
+// Credit to: Filip Pynckels - MIT/GPL dual (http://users.telenet.be/pynckels/2020-2-Linux-kernel-unexported-kallsyms-functions.pdf)
+unsigned long lookup_name( const char *name ){
+    struct kprobe kp;
+    unsigned long retval;
+
+    kp.symbol_name = name;
+    if (register_kprobe(&kp) < 0) return 0;
+    retval = (unsigned long)kp.addr;
+    unregister_kprobe(&kp);
+    return retval;
+}
 
 //We do not really support multiple KVM instances here
 struct vcpu_offset_info {
@@ -68,7 +81,7 @@ static void vcpu_pre_run(struct kvm_vcpu *vcpu) {
 	struct vcpu_offset_info *off_info;
 	int tsc_off = constant_tsc_offset;
 
-	tsc_offset = kvm_x86_ops->read_l1_tsc_offset(vcpu);
+	tsc_offset = kvm_x86_ops.read_l1_tsc_offset(vcpu);
 	new_tsc_offset = tsc_offset;
 	off_info = get_cpu_offset_info(vcpu);
 
@@ -92,7 +105,7 @@ static void vcpu_pre_run(struct kvm_vcpu *vcpu) {
 	}
 
 	if (tsc_offset ^ new_tsc_offset)
-			vcpu->arch.tsc_offset = kvm_x86_ops->write_l1_tsc_offset(vcpu, new_tsc_offset);
+			vcpu->arch.tsc_offset = kvm_x86_ops.write_l1_tsc_offset(vcpu, new_tsc_offset);
 
 	off_info->called_cpuid = 0;
 }
@@ -149,7 +162,7 @@ static int vmhook_init(void)
 
 	printkvm("initializing...\n");
 
-	kvm_set_tsc_khz = (typeof(kvm_set_tsc_khz))kallsyms_lookup_name("kvm_set_tsc_khz");
+	kvm_set_tsc_khz = (typeof(kvm_set_tsc_khz))lookup_name("kvm_set_tsc_khz");
 
 	ret = start_hook_list(hook_list, ARRAY_SIZE(hook_list));
 
