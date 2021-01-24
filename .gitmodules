@@ -1,3 +1,6 @@
 [submodule "kernel-hook"]
 	path = kernel-hook
 	url = https://github.com/Heep042/kernel-hook.git
+[submodule "kallsyms-mod"]
+	path = kallsyms-mod
+	url = git@github.com:h33p/kallsyms-mod.git

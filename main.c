@@ -1,6 +1,7 @@
 #include "kernel-hook/hook.h"
 #include <linux/kvm_types.h>
 #include <linux/kvm_host.h>
+#include "kallsyms-mod/kallsyms.c"
 
 MODULE_DESCRIPTION("Hook and correct KVM TSC timer on X86 platforms. Only one KVM instance is supported.");
 MODULE_AUTHOR("Heep");
@@ -68,7 +69,7 @@ static void vcpu_pre_run(struct kvm_vcpu *vcpu) {
 	struct vcpu_offset_info *off_info;
 	int tsc_off = constant_tsc_offset;
 
-	tsc_offset = kvm_x86_ops->read_l1_tsc_offset(vcpu);
+	tsc_offset = vcpu->arch.l1_tsc_offset;
 	new_tsc_offset = tsc_offset;
 	off_info = get_cpu_offset_info(vcpu);
 
@@ -92,7 +93,7 @@ static void vcpu_pre_run(struct kvm_vcpu *vcpu) {
 	}
 
 	if (tsc_offset ^ new_tsc_offset)
-			vcpu->arch.tsc_offset = kvm_x86_ops->write_l1_tsc_offset(vcpu, new_tsc_offset);
+			vcpu->arch.tsc_offset = kvm_x86_ops.write_l1_tsc_offset(vcpu, new_tsc_offset);
 
 	off_info->called_cpuid = 0;
 }
@@ -148,6 +149,9 @@ static int vmhook_init(void)
 	int ret;
 
 	printkvm("initializing...\n");
+
+	if ((ret = init_kallsyms()))
+		return ret;
 
 	kvm_set_tsc_khz = (typeof(kvm_set_tsc_khz))kallsyms_lookup_name("kvm_set_tsc_khz");
 
